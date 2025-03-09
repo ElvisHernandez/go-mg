@@ -23,25 +23,35 @@ func logError(e error) {
 	}
 }
 
+const GO_MG_ENV_VAR string = "GO_MG_MIGRATIONS_DIR"
+const DATABASE_CONNECTION string = "DATABASE_CONNECTION"
+
+type App struct {
+	migrationsDir            string
+	databaseConnectionString string
+}
+
 func main() {
 	createMigrationCmd := flag.NewFlagSet("create", flag.ExitOnError)
-	migrationDirPath := createMigrationCmd.String("dir", "./migrations/versions", "The path to the migration directory")
-
 	migrateMigrationCmd := flag.NewFlagSet("migrate", flag.ExitOnError)
-
 	seedCmd := flag.NewFlagSet("seed", flag.ExitOnError)
 	seedSqlFile := seedCmd.String("path", "", "The path to the file to be seeded")
+
+	app := &App{}
 
 	switch os.Args[1] {
 	case "create":
 		createMigrationCmd.Parse(os.Args[2:])
-		createMigrationCommand(*migrationDirPath)
+		setupApp(app)
+		createMigrationCommand(app)
 	case "migrate":
 		migrateMigrationCmd.Parse(os.Args[2:])
-		runMigrationCommand()
+		setupApp(app)
+		runMigrationCommand(app)
 	case "seed":
 		seedCmd.Parse(os.Args[2:])
-		seedDatabase(*seedSqlFile)
+		setupApp(app)
+		seedDatabase(app, *seedSqlFile)
 	case "help":
 		createMigrationCmd.Usage()
 		// migrateMigrationCmd.Usage()
@@ -49,13 +59,13 @@ func main() {
 	}
 }
 
-func seedDatabase(pathOfFileToSeed string) {
+func seedDatabase(app *App, pathOfFileToSeed string) {
 	file, err := os.ReadFile(pathOfFileToSeed)
 	logError(err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	db := openDB()
+	db := openDB(app)
 
 	tx, err := db.BeginTx(ctx, nil)
 	logError(err)
@@ -70,8 +80,8 @@ func seedDatabase(pathOfFileToSeed string) {
 	tx.Commit()
 }
 
-func runMigrationCommand() {
-	db := openDB()
+func runMigrationCommand(app *App) {
+	db := openDB(app)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -79,7 +89,8 @@ func runMigrationCommand() {
 	var lastMigration string
 
 	if !migrationTableExists {
-		createMigrationTable(db, ctx)
+		_, err := db.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS migration (name VARCHAR(255) PRIMARY KEY);")
+		logError(err)
 	}
 
 	err := db.QueryRowContext(ctx, "select name from migration;").Scan(&lastMigration)
@@ -87,7 +98,7 @@ func runMigrationCommand() {
 		logError(err)
 	}
 
-	migrationVersions := getSortedMigrations()
+	migrationVersions := getSortedMigrations(app)
 	startingMigrationIndex := 0
 
 	for migrationIndex, migrationEntry := range migrationVersions {
@@ -101,16 +112,16 @@ func runMigrationCommand() {
 		return
 	}
 
-	migrateSqlFiles(db, ctx, migrationVersions[startingMigrationIndex:])
+	migrateSqlFiles(app, db, ctx, migrationVersions[startingMigrationIndex:])
 }
 
-func migrateSqlFiles(db *sql.DB, ctx context.Context, migrationFiles []os.DirEntry) {
+func migrateSqlFiles(app *App, db *sql.DB, ctx context.Context, migrationFiles []os.DirEntry) {
 	tx, err := db.BeginTx(ctx, nil)
 	logError(err)
 	var lastProcessedMigration string
 
 	for _, migrationEntry := range migrationFiles {
-		upFile, err := os.ReadFile(filepath.Join("./migrations/versions", migrationEntry.Name(), "up.sql"))
+		upFile, err := os.ReadFile(filepath.Join(app.migrationsDir, migrationEntry.Name(), "up.sql"))
 		logError(err)
 
 		_, err = tx.Exec(string(upFile))
@@ -145,13 +156,8 @@ func migrateSqlFiles(db *sql.DB, ctx context.Context, migrationFiles []os.DirEnt
 	tx.Commit()
 }
 
-func createMigrationTable(db *sql.DB, ctx context.Context) {
-	_, err := db.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS migration (name VARCHAR(255) PRIMARY KEY);")
-	logError(err)
-}
-
-func getSortedMigrations() []os.DirEntry {
-	migrationVersions, err := os.ReadDir("./migrations/versions")
+func getSortedMigrations(app *App) []os.DirEntry {
+	migrationVersions, err := os.ReadDir(filepath.Join(app.migrationsDir))
 	logError(err)
 
 	slices.SortFunc(migrationVersions, func(a, b os.DirEntry) int {
@@ -171,7 +177,7 @@ func getSortedMigrations() []os.DirEntry {
 	return migrationVersions
 }
 
-func createMigrationCommand(migrationsDirPath string) {
+func createMigrationCommand(app *App) {
 	// Get new migration name from user
 	var name string
 	fmt.Print("Enter migration name (spaces in the name are not allowed): ")
@@ -179,7 +185,7 @@ func createMigrationCommand(migrationsDirPath string) {
 
 	// Create new migration directory
 	newMigrationDirName := name + "-" + fmt.Sprint(time.Now().Unix())
-	newMigrationDirPath := filepath.Join(migrationsDirPath, newMigrationDirName)
+	newMigrationDirPath := filepath.Join(app.migrationsDir, newMigrationDirName)
 	err := os.MkdirAll(newMigrationDirPath, 0770)
 	logError(err)
 
@@ -192,8 +198,8 @@ func createMigrationCommand(migrationsDirPath string) {
 	logError(err)
 }
 
-func openDB() *sql.DB {
-	pool, err := sql.Open("postgres", "postgres://elvis:password@localhost/migrations_test?sslmode=disable")
+func openDB(app *App) *sql.DB {
+	pool, err := sql.Open("postgres", app.databaseConnectionString)
 	logError(err)
 
 	if err = pool.Ping(); err != nil {
@@ -213,5 +219,25 @@ func migrationsTableExists(db *sql.DB, ctx context.Context) bool {
 	logError(err)
 
 	return exists
+}
+
+func setupApp(app *App) {
+	migrationsDir := os.Getenv(GO_MG_ENV_VAR)
+
+	if migrationsDir == "" {
+		fmt.Printf("The %v environment variable has to be set\n", GO_MG_ENV_VAR)
+		os.Exit(0)
+	}
+
+	app.migrationsDir = migrationsDir
+
+	databaseConnectionString := os.Getenv(DATABASE_CONNECTION)
+
+	if databaseConnectionString == "" {
+		fmt.Printf("The %v environment variable has to be set\n", DATABASE_CONNECTION)
+		os.Exit(0)
+	}
+
+	app.databaseConnectionString = databaseConnectionString
 }
 
